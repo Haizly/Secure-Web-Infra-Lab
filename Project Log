@@ -1,0 +1,121 @@
+# Project Log: Building & Defending a Public Web Application
+
+This is the fuller story behind the [README](./README.md) — the actual build-test-break-fix journey, including the parts that didn't work the first time. Live infrastructure details (real domain, IPs, credentials) are intentionally left out; everything here is about the tools, the failures, and what they taught.
+
+---
+
+## 1. Starting Local, Then Going Public
+
+The first attempt at this project was a local VirtualBox VM. It crashed mid-write when its disk filled up unexpectedly — a database process couldn't save and the whole VM had to be force-closed and scrapped.
+
+**Lesson:** plan disk size upfront, and don't let a VM's disk fill silently. It's a boring failure mode, but it wastes real time if you don't catch it early.
+
+That crash was also a useful forcing function: the project needed to be publicly accessible and sit behind a real CDN/WAF, which meant a local VM was the wrong tool from the start. Shared hosting was ruled out too — no root access, no ability to install Docker or run security tooling. A real VPS with full root access was the only option that actually fit the requirements.
+
+---
+
+## 2. The Foundation
+
+SSH access was locked down early — key-based authentication only, password login disabled outright. A basic firewall was configured to only allow the minimum necessary ports, and automated ban tooling was added to handle repeated failed login attempts.
+
+The application itself was built as three separate containers, orchestrated together: a reverse proxy in front, a Python backend handling logic and authentication, and a database behind it, isolated from any direct internet access. Splitting these into containers meant each piece could be restarted, rebuilt, or patched independently without taking down the others.
+
+One early habit that paid off repeatedly: taking a system snapshot after every stage that reached a stable, working state — *before* touching anything new. When later stages went sideways (and they did, more than once), having a known-good checkpoint mattered more than any real-time debugging skill.
+
+---
+
+## 3. The SIEM Install That Wouldn't Cooperate
+
+Installing the SIEM/EDR platform was, by a wide margin, the hardest part of this project. Not because any single step was conceptually difficult — because of how many ways a multi-component install could quietly break itself.
+
+**Round 1:** The manager, indexer, and dashboard all installed cleanly together and worked. Then, thinking a local agent was needed to monitor the host itself, a separate agent package was installed alongside the manager on the same machine.
+
+That silently removed the manager. Manager and agent packages conflict on a single box and can't coexist — the dashboard just started throwing errors, with no obvious link back to the agent install.
+
+**Round 2:** Reinstalling the manager pulled a different version than what the indexer and dashboard were running. Mismatched versions across components caused ongoing instability until everything was pinned to the exact same release.
+
+**Round 3:** After the version mismatch, the dashboard started returning authentication errors instead of the login page. The internal service account credentials the dashboard used no longer matched what the indexer expected — a side effect of `apt remove --purge` *not* actually removing all the data directories from previous install attempts. Stale security config data was surviving reinstalls and clashing with fresh ones.
+
+**The Timeshift detour:** rather than keep chasing the credential mismatch, the plan was to roll back to a clean pre-install snapshot using the system's backup/restore tool. The restore process segfaulted immediately after the bootloader-reinstall step — twice, with different settings. Digging into this later confirmed it's a known, long-standing, unresolved bug in that tool specifically on virtualized/cloud environments — the tool assumes a physical machine's boot process, which cloud VPS environments don't replicate correctly.
+
+**Lesson:** snapshot *creation* isn't the same as reliable *restore*. Always test the restore path before trusting it as a safety net — and if a tool wasn't designed with your environment in mind (cloud vs. physical hardware), don't assume it'll behave the same way.
+
+**The actual fix:** manual cleanup. Every stale directory left behind by the failed installs and incomplete purges had to be found and force-deleted by hand, then the SIEM components reinstalled one at a time (not via the all-in-one install flag) to isolate any remaining issues. That clean, step-by-step install finally completed without errors.
+
+Along the way, two more small but instructive problems came up: the install script rejected the server's real public IP during multi-node config generation (it assumes private IPs for clustered setups — using localhost addressing was the correct fix for a single-box install), and the dashboard's default port collided with the web application's own HTTPS port, requiring the dashboard to be moved to a dedicated port.
+
+**Bigger lesson from this whole saga:** package removal tools often don't fully clean up application data directories. When reinstalling something that's misbehaving, verify — don't assume — that a "removed" component is actually gone.
+
+---
+
+## 4. Turning On Real Network Visibility
+
+With the SIEM stable, a network intrusion detection tool was added to actually watch traffic at the packet level, not just application logs. The default configuration assumed a private, internal network — which is wrong for a public-facing server — so the tool's understanding of "which traffic is mine vs. external" had to be corrected before it worked meaningfully.
+
+Wiring its alerts into the SIEM was a matter of pointing the SIEM's log collector at the new tool's output file. Once connected, alert volume in the dashboard jumped noticeably — file integrity monitoring events were now joined by real network-level detections.
+
+**Real-world validation:** not long after, a genuine spike in alerts appeared — dozens of password-guessing attempts against SSH, all flagged under recognizable attack categories. Checking the actual source IP on those events (rather than assuming it was noise from the project's own testing) confirmed it: a real external attacker, not internal activity. The detection stack caught it, logged it, and the automated ban tooling was actively working against a completely different attacking IP in parallel.
+
+Because SSH was already locked to key-only authentication, the brute-force attempts were guaranteed to fail regardless of how many were tried — but seeing the full detection chain fire correctly against a real, unprompted attack was worth more than any synthetic test could have been.
+
+**Lesson:** a spike in alerts isn't automatically bad news, and it isn't automatically an attack either — always check the specific events behind a spike before reacting. More than once during this project, a scary-looking alert spike turned out to just be normal reconnect traffic from active development work.
+
+---
+
+## 5. When the Firewall Wasn't Actually the Firewall
+
+After a mentor review flagged that the server was reachable by IP address directly, bypassing the CDN entirely, the fix seemed simple: the host firewall was already supposedly restricted to only allow the CDN's published IP ranges.
+
+Testing from an external client showed otherwise — direct IP access still worked, despite the firewall rules looking correct on paper.
+
+The root cause turned out to be a well-documented but easy-to-miss conflict: the container orchestration tool manages its own network address translation rules directly at the kernel level, and those rules are evaluated *before* the host firewall's rules ever run. In effect, the firewall's IP restriction had never actually applied to anything the container platform was publishing — it was decorative for that traffic.
+
+A community tool exists specifically to fix this exact conflict, by inserting rules that the container platform respects ahead of its own default-allow behavior. Installing it, however, immediately broke *all* traffic — including legitimate traffic — because the tool only changes *how* the container platform's rules get evaluated; it doesn't add any allow rules of its own. Attempting to add those explicit allow rules afterward failed with lookup errors that weren't fully resolved under time pressure.
+
+Given that the original issue had been described as "not ideal" rather than critical, and the attempted fix was now actively breaking a working, live system, the call was made to revert rather than keep pushing on unfamiliar territory.
+
+**Lesson:** different system components can each "own" different pieces of low-level network configuration, and restarting one service doesn't guarantee another component's state gets cleanly reset. And just as importantly: recognizing when a "nice to have" fix is turning into a bigger, riskier problem — and choosing to back out — is a real engineering skill, not a failure.
+
+---
+
+## 6. Finding (and Fixing) Real Vulnerabilities
+
+With the infrastructure stable, the focus shifted to actually trying to break the application itself.
+
+**Session cookie audit:** manually inspecting the application's session cookie in browser dev tools revealed it was missing a flag that restricts it to encrypted connections only. In practice, this meant that if a user's browser ever made even a single request over an unencrypted connection — a small window that can exist even with automatic HTTPS redirects in place — the session cookie could theoretically be intercepted. Fixed by explicitly setting the cookie's security flags in the application code, rather than relying solely on the CDN's HTTPS enforcement to cover the gap.
+
+**Hardcoded secret key:** a leftover placeholder secret key from the original project template was still present in the code, unchanged. A predictable secret key would let an attacker forge valid session data without ever needing to steal anything. Replaced with a cryptographically random value.
+
+**Container image scanning:** running a vulnerability scanner against every container image surfaced dozens of known CVEs — the majority traced to outdated bundled dependencies rather than the core software itself. Pulling updated image versions resolved most of these outright. One remaining finding, in a bundled helper utility inside the database image, was investigated and assessed as low real-world risk: the vulnerable code path involved network operations that the helper tool never actually performs. That finding was documented as a known, accepted risk rather than something requiring an immediate local fix — the real remediation depends on the upstream image maintainers rebuilding with a newer compiler.
+
+**Live application scanning:** a web vulnerability scanner run against the live site flagged two findings, both investigated and confirmed to be false positives — one caused by the scanner's own traffic getting caught by an unrelated geo-restriction rule, the other a harmless, standard CDN tracing header the scanner simply didn't recognize.
+
+**Lesson:** a vulnerability scanner tells you what's *installed*, not what's *exploitable*. Every finding needs a follow-up judgment call about real-world reachability and risk — panicking at a severity label without that context isn't useful triage.
+
+---
+
+## 7. Chasing a Ghost: The Connectivity Investigation
+
+Partway through the project, SSH and basic network reachability to the server started failing — but only from one specific network. Systematically ruling out causes mattered more than guessing:
+
+- Checked server health directly through the hosting provider's own control panel and browser-based terminal — CPU, memory, and uptime all looked completely normal, ruling out a crash or resource exhaustion.
+- Checked active connection counts and system load — nothing resembling a denial-of-service pattern.
+- Tested from a second, different network expecting it to work as a "control" — it also failed, until it became clear that network blocked basic reachability testing *universally*, for everyone, unrelated to this server at all. A control test is only useful if you've verified it's actually a valid control.
+- Ruled out the CDN as a cause entirely, since SSH traffic never routes through it in the first place — only the domain's web traffic does.
+
+The most likely remaining explanation was carrier-side throttling or filtering building up gradually on that one specific network — not something fixable from the server side. A reliable fallback (the hosting provider's own browser-based terminal, which routes around the affected network path entirely) was adopted for whenever that specific network was in use.
+
+**Lesson:** when isolating a network problem, always verify your "control" test doesn't have its own unrelated restrictions — otherwise a control test can produce a false confirmation instead of real signal.
+
+---
+
+## 8. What This Project Actually Taught
+
+- **Defaults are not accidents.** Security features that ship "off" by default (cookie flags, restrictive service accounts) usually exist because the tool's authors can't predict every legitimate use case a stricter default might break — but that means it's on you to turn them on deliberately.
+- **Layered defense means no single failure is fatal.** More than one control in this project turned out to have a real gap at some point — but because multiple independent layers existed, no single gap ever became a full compromise.
+- **Tooling can lie to you in specific, structural ways** — a restore feature that doesn't match its creation feature's reliability, a firewall rule that looks correct but never actually gets evaluated, a test run from the wrong vantage point producing misleading results. Understanding *why* a tool failed matters more than just finding a workaround.
+- **Knowing when to stop is a skill.** More than once, the right call was reverting a change and living with a known, lower-priority gap rather than pushing further into an unfamiliar, high-risk fix under time pressure.
+
+---
+
+*A formal penetration test is the next milestone for this project. This log will be updated with what was found.*
